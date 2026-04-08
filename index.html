@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Pose Breakout - Relaxed Edition</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { 
+            margin: 0; 
+            background: #000; 
+            color: #eee; 
+            font-family: 'Helvetica Neue', Arial, sans-serif; 
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        canvas { 
+            background: #000; 
+            display: block;
+        }
+
+        #input_video {
+            display: none;
+        }
+
+        /* 難易度選択UIのスタイル */
+        #ui_container {
+            position: absolute;
+            top: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 8px 15px;
+            border-radius: 5px;
+            border: 1px solid #00ff88;
+            color: #fff;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        #speedSelect {
+            background: #222;
+            color: #00ff88;
+            border: 1px solid #00ff88;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+        }
+
+        #speedSelect:disabled {
+            color: #555;
+            border-color: #555;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui_container">
+        <label for="speedSelect">スピード（難易度）:</label>
+        <select id="speedSelect">
+            <option value="4">4</option>
+            <option value="5">5</option>
+            <option value="6">6</option>
+            <option value="7" selected>7 (デフォルト)</option>
+            <option value="8">8</option>
+            <option value="9">9</option>
+            <option value="10">10</option>
+            <option value="11">11</option>
+            <option value="12">12</option>
+        </select>
+    </div>
+
+    <video id="input_video"></video>
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * 1. 基本設定
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const speedSelect = document.getElementById('speedSelect');
+
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+resizeCanvas();
+
+// ブロック配置設定
+const rowCount = 10;
+const columnCount = 20;
+const brickPadding = 5;
+const brickOffsetTop = 50; 
+let brickWidth = (canvas.width / columnCount) - brickPadding;
+const brickHeight = 20;
+
+let paddleWidth = 200; 
+let paddleHeight = 20; 
+let paddleY = canvas.height - 20; 
+let paddleX = (canvas.width - paddleWidth) / 2;
+
+let ballRadius = 9.6;
+let x, y, dx, dy;
+
+// -------- スピードをドロップダウンから取得 -----------------
+let baseSpeed = 7; 
+
+let score = 0;
+let timeLeft = 90; 
+let gameRunning = false;  
+let ballLaunched = false; 
+let isGameOver = false;   
+let cameraReady = false; 
+let message = "カメラ起動中..."; 
+let bricks = [];
+let timerInterval = null;
+
+// ポーズ制御
+let baseNoseX = 0.5; 
+let currentNoseX = 0.5;
+let handWasDown = true; 
+let calibrated = false; // 初回起動キャリブレーション用
+
+/**
+ * 2. 音声エンジン
+ */
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playSound(freq, type = 'sine', decay = 0.1) {
+    try {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + decay);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + decay);
+    } catch(e) {}
+}
+
+/**
+ * 3. ゲーム管理
+ */
+function initBricks() {
+    bricks = [];
+    brickWidth = (canvas.width / columnCount) - brickPadding;
+    for(let c=0; c<columnCount; c++) {
+        bricks[c] = [];
+        for(let r=0; r<rowCount; r++) {
+            bricks[c][r] = { x: 0, y: 0, status: 1 };
+        }
+    }
+}
+
+function resetToReady() {
+    score = 0;
+    timeLeft = 90; 
+    gameRunning = false;
+    ballLaunched = false;
+    isGameOver = false;
+    
+    // ドロップダウンの値を反映
+    baseSpeed = parseInt(speedSelect.value, 10);
+    dx = baseSpeed; 
+    dy = -baseSpeed;
+    
+    // ドロップダウンを操作可能に
+    speedSelect.disabled = false;
+
+    if (cameraReady) message = "片手を挙げてスタート！";
+    initBricks();
+    if (timerInterval) clearInterval(timerInterval);
+}
+
+// ドロップダウンが変更されたら即座にスピードに反映
+speedSelect.addEventListener('change', (e) => {
+    baseSpeed = parseInt(e.target.value, 10);
+    if (!ballLaunched) {
+        dx = baseSpeed;
+        dy = -baseSpeed;
+    }
+});
+
+/**
+ * 4. MediaPipe Pose 解析
+ */
+const videoElement = document.getElementById('input_video');
+const pose = new Pose({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+});
+
+pose.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+});
+
+pose.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => { await pose.send({image: videoElement}); },
+    width: 640, height: 480
+});
+camera.start();
+
+function onResults(results) {
+    if (!results.poseLandmarks) return;
+    
+    const landmarks = results.poseLandmarks;
+    const nose = landmarks[0];
+    currentNoseX = nose.x; 
+
+    // ★ 修正：カメラが初めて体を認識した瞬間の位置をセンターに固定。
+    // 以降はスタートやリセットの動作で上書き（ズレ）しません。
+    if (!calibrated) {
+        baseNoseX = currentNoseX;
+        calibrated = true;
+        cameraReady = true;
+        message = "片手を挙げてスタート！";
+    }
+
+    // パドル移動
+    const sensitivity = 2;
+    let diff = (baseNoseX - currentNoseX) * sensitivity;
+    let newX = (canvas.width / 2 - paddleWidth / 2) + (diff * canvas.width);
+    
+    if (newX < 0) newX = 0;
+    if (newX > canvas.width - paddleWidth) newX = canvas.width - paddleWidth;
+    paddleX = newX;
+
+    const leftWrist = landmarks[15];
+    const rightWrist = landmarks[16];
+    const isHandRaised = (leftWrist.y < nose.y) || (rightWrist.y < nose.y);
+
+    if (isGameOver) {
+        if (isHandRaised && handWasDown) {
+            resetToReady();
+            handWasDown = false;
+        }
+    } else if (!gameRunning || !ballLaunched) {
+        // ★ 修正：手を挙げたら即ゲーム開始 ＆ ボール発射！
+        if (isHandRaised && handWasDown) {
+            startGame();
+            handWasDown = false;
+        }
+    }
+
+    if (!isHandRaised) handWasDown = true;
+}
+
+function startGame() {
+    gameRunning = true;
+    ballLaunched = true; // ★ 即発射
+    message = "";
+    //playSound(523, 'sine', 0.2);
+    playSound(1000, 'sine', 0.3);
+
+    speedSelect.disabled = true;
+
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(() => {
+        if (gameRunning && ballLaunched) {
+            timeLeft--;
+            if (timeLeft <= 0) endGame("TIME UP!");
+        }
+    }, 1000);
+}
+
+function endGame(msg) {
+    gameRunning = false;
+    ballLaunched = false;
+    isGameOver = true;
+    clearInterval(timerInterval);
+    message = msg + " (手を挙げてリセット)";
+    playSound(200, 'triangle', 0.5);
+    
+    speedSelect.disabled = false;
+}
+
+/**
+ * 5. 描画・物理
+ */
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    drawHUD(); 
+    drawBricks();
+    drawPaddle();
+    drawBall();
+    drawMessages();
+
+    if (gameRunning && ballLaunched) {
+        updatePhysics();
+    } else if (!isGameOver) {
+        // 発射前やミス後は、パドルの動きに合わせてボールが追従します
+        x = paddleX + paddleWidth / 2;
+        y = paddleY - ballRadius - 2;
+    }
+
+    requestAnimationFrame(draw);
+}
+
+function drawHUD() {
+    ctx.font = "bold 24px Arial";
+    ctx.fillStyle = "#00ff88";
+    ctx.textAlign = "left";
+    ctx.fillText(`SCORE: ${score}`, 30, 30);
+    ctx.textAlign = "right";
+    ctx.fillText(`TIME: ${timeLeft}`, canvas.width - 30, 30);
+}
+
+function drawPaddle() {
+    ctx.fillStyle = "#00ff00";
+    ctx.fillRect(paddleX, paddleY, paddleWidth, paddleHeight);
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(paddleX, paddleY, paddleWidth, paddleHeight);
+}
+
+function drawBall() {
+    if (isGameOver && !ballLaunched) return;
+    ctx.beginPath();
+    ctx.arc(x, y, ballRadius, 0, Math.PI*2);
+    ctx.fillStyle = "#fff";
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = "#00ff88";
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.closePath();
+}
+
+function drawBricks() {
+    for(let c=0; c<columnCount; c++) {
+        for(let r=0; r<rowCount; r++) {
+            if(bricks[c] && bricks[c][r] && bricks[c][r].status === 1) {
+                let bx = (c * (brickWidth + brickPadding)) + (brickPadding/2);
+                let by = (r * (brickHeight + brickPadding)) + brickOffsetTop;
+                bricks[c][r].x = bx;
+                bricks[c][r].y = by;
+                ctx.fillStyle = `hsl(${r * 15 + 160}, 70%, 50%)`;
+                ctx.fillRect(bx, by, brickWidth, brickHeight);
+            }
+        }
+    }
+}
+
+function drawMessages() {
+    if (message !== "") {
+        ctx.font = "bold 40px sans-serif";
+        ctx.fillStyle = "#00ff88";
+        ctx.textAlign = "center";
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = "#000";
+        ctx.fillText(message, canvas.width / 2, canvas.height / 2 + 50);
+        ctx.shadowBlur = 0;
+    }
+}
+
+function updatePhysics() {
+    // 壁反射
+    if(x + dx > canvas.width - ballRadius || x + dx < ballRadius) {
+        dx = -dx;
+        //playSound(800, 'sine', 0.05);
+        playSound(800, 'sine', 0.2);  
+    }
+    if(y + dy < ballRadius) {
+        dy = -dy;
+        ///playSound(800, 'sine', 0.05);
+        playSound(800, 'sine', 0.2);
+    }
+
+    // パドル反射
+    if(y + dy > paddleY && y + dy < paddleY + paddleHeight) {
+        if(x > paddleX && x < paddleX + paddleWidth) {
+            dy = -Math.abs(dy);
+            let deltaX = x - (paddleX + paddleWidth / 2);
+            dx = deltaX * 0.09; 
+            //playSound(400, 'sine', 0.15);
+            playSound(800, 'sine', 0.2);
+        }
+    }
+
+    // 落下判定
+    if(y > canvas.height) {
+        ballLaunched = false;
+        score -= 100; 
+        message = "片手を挙げて再発射！";
+        playSound(150, 'sawtooth', 0.3);
+    }
+
+    // ブロック衝突
+    for(let c=0; c<columnCount; c++) {
+        for(let r=0; r<rowCount; r++) {
+            let b = bricks[c][r];
+            if(b && b.status === 1) {
+                if(x > b.x && x < b.x + brickWidth && y > b.y && y < b.y + brickHeight) {
+                    dy = -dy;
+                    b.status = 0;
+                    score += 10;
+                    //playSound(600, 'sine', 0.08);
+                    playSound(1000, 'sine', 0.15);
+
+                    if(score >= rowCount * columnCount * 10) endGame("CLEAR!");
+                }
+            }
+        }
+    }
+    x += dx;
+    y += dy;
+}
+
+window.addEventListener('resize', () => {
+    resizeCanvas();
+    paddleY = canvas.height - 20;
+    initBricks();
+});
+
+initBricks();
+resetToReady();
+draw();
+
+</script>
+</body>
+</html>
